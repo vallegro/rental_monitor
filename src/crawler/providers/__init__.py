@@ -1,5 +1,5 @@
 """Provider implementations for the crawler package."""
 
-from .static import StaticListingProvider
+from .zillow import ZillowChromiumProvider
 
-__all__ = ["StaticListingProvider"]
+__all__ = ["ZillowChromiumProvider"]

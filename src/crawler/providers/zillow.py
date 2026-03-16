@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import copy
 from html.parser import HTMLParser
+import importlib.util
 import json
+from pathlib import Path
 import re
 from typing import Any, Iterable
 from urllib.parse import quote, urljoin
@@ -11,12 +12,6 @@ from ..browser import ChromiumBrowser
 from ..models import ProviderListing, SearchRequest
 from ..provider_contracts import ListingProviderError
 
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:  # pragma: no cover - optional dependency in some environments
-    curl_requests = None
-
-
 PRICE_PATTERN = re.compile(r"(\d[\d,]*)")
 ZIP_CODE_PATTERN = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 SCRIPT_ASSIGNMENT_PATTERN = re.compile(
@@ -24,23 +19,28 @@ SCRIPT_ASSIGNMENT_PATTERN = re.compile(
     re.DOTALL,
 )
 JSON_PARSE_PATTERN = re.compile(r"JSON\.parse\((\".*?\")\)", re.DOTALL)
-ASYNC_SEARCH_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en",
-    "Content-Type": "application/json",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "origin": "https://www.zillow.com",
-    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
+
+
+def _load_pyzill_for_rent():
+    pyzill_search_path = Path(__file__).resolve().parents[3] / "reference" / "pyzill" / "src" / "pyzill" / "search.py"
+    if not pyzill_search_path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location("_reference_pyzill_search", pyzill_search_path)
+    if spec is None or spec.loader is None:
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # pragma: no cover - depends on optional local reference dependencies
+        return None
+
+    for_rent = getattr(module, "for_rent", None)
+    return for_rent if callable(for_rent) else None
+
+
+PYZILL_FOR_RENT = _load_pyzill_for_rent()
 
 
 class ZillowChromiumProvider:
@@ -77,7 +77,7 @@ class ZillowChromiumProvider:
                 "complete the challenge in the opened browser window and retry."
             )
 
-        listings = self._extract_api_listings(html, request)
+        listings = self._extract_pyzill_listings(html, request)
         if not listings:
             listings = self.extract_listings(html, request.zip_code)
         return [listing for listing in listings if self._matches_request(listing, request)]
@@ -103,15 +103,15 @@ class ZillowChromiumProvider:
 
         return self._extract_fallback_anchor_listings(html, zip_code)
 
-    def _extract_api_listings(self, html: str, request: SearchRequest) -> list[ProviderListing]:
-        if curl_requests is None:
+    def _extract_pyzill_listings(self, html: str, request: SearchRequest) -> list[ProviderListing]:
+        if PYZILL_FOR_RENT is None:
             return []
 
         search_context = self._extract_search_context(html, request)
         if search_context is None:
             return []
 
-        search_results = self._fetch_async_search_results(search_context, request)
+        search_results = self._fetch_pyzill_results(search_context, request)
         candidates = search_results.get("mapResults") or search_results.get("listResults") or []
         listings: dict[str, ProviderListing] = {}
         for candidate in candidates:
@@ -155,84 +155,32 @@ class ZillowChromiumProvider:
         if not all(bound in map_bounds for bound in ("west", "east", "south", "north")):
             return None
 
-        filter_state = query_state.get("filterState")
-        if not isinstance(filter_state, dict):
-            filter_state = {}
-
         return {
             "mapBounds": map_bounds,
-            "filterState": filter_state,
-            "regionSelection": query_state.get("regionSelection"),
             "mapZoom": query_state.get("mapZoom", 13),
             "usersSearchTerm": query_state.get("usersSearchTerm") or request.zip_code,
         }
 
-    def _fetch_async_search_results(self, search_context: dict[str, Any], request: SearchRequest) -> dict[str, Any]:
-        filter_state = self._build_api_filter_state(search_context.get("filterState", {}), request)
-        payload: dict[str, Any] = {
-            "searchQueryState": {
-                "isMapVisible": True,
-                "isListVisible": True,
-                "mapBounds": search_context["mapBounds"],
-                "filterState": filter_state,
-                "mapZoom": search_context.get("mapZoom", 13),
-                "pagination": {"currentPage": 1},
-                "usersSearchTerm": search_context.get("usersSearchTerm") or request.zip_code,
-            },
-            "wants": {
-                "cat1": ["listResults", "mapResults"],
-                "cat2": ["total"],
-            },
-            "requestId": 10,
-            "isDebugRequest": False,
-        }
-
-        region_selection = search_context.get("regionSelection")
-        if region_selection:
-            payload["searchQueryState"]["regionSelection"] = region_selection
-
-        response = curl_requests.put(
-            url=f"{self.base_url}/async-create-search-page-state",
-            json=payload,
-            headers=ASYNC_SEARCH_HEADERS,
-            impersonate="chrome124",
+    def _fetch_pyzill_results(self, search_context: dict[str, Any], request: SearchRequest) -> dict[str, Any]:
+        map_bounds = search_context["mapBounds"]
+        response = PYZILL_FOR_RENT(
+            pagination=1,
+            search_value=search_context.get("usersSearchTerm") or request.zip_code,
+            is_entire_place=True,
+            is_room=False,
+            min_beds=request.beds,
+            max_beds=None,
+            min_bathrooms=request.baths,
+            max_bathrooms=None,
+            min_price=request.min_rent,
+            max_price=request.max_rent,
+            ne_lat=map_bounds["north"],
+            ne_long=map_bounds["east"],
+            sw_lat=map_bounds["south"],
+            sw_long=map_bounds["west"],
+            zoom_value=search_context.get("mapZoom", 13),
         )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("cat1", {}).get("searchResults", {})
-
-    def _build_api_filter_state(self, base_filter_state: dict[str, Any], request: SearchRequest) -> dict[str, Any]:
-        filter_state = copy.deepcopy(base_filter_state)
-        filter_state.update(
-            {
-                "sortSelection": {"value": "priorityscore"},
-                "isNewConstruction": {"value": False},
-                "isForSaleForeclosure": {"value": False},
-                "isForSaleByOwner": {"value": False},
-                "isForSaleByAgent": {"value": False},
-                "isForRent": {"value": True},
-                "isComingSoon": {"value": False},
-                "isAuction": {"value": False},
-                "isAllHomes": {"value": True},
-                "isEntirePlaceForRent": {"value": True},
-            }
-        )
-
-        if request.min_rent is not None or request.max_rent is not None:
-            price_filter: dict[str, Any] = {}
-            if request.min_rent is not None:
-                price_filter["min"] = request.min_rent
-            if request.max_rent is not None:
-                price_filter["max"] = request.max_rent
-            filter_state["price"] = price_filter
-
-        if request.beds is not None:
-            filter_state["beds"] = {"min": request.beds}
-
-        if request.baths is not None:
-            filter_state["baths"] = {"min": request.baths}
-
-        return filter_state
+        return response if isinstance(response, dict) else {}
 
     def _convert_candidate_to_listing(
         self,

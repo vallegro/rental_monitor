@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from html.parser import HTMLParser
 import json
 import re
@@ -10,6 +11,11 @@ from ..browser import ChromiumBrowser
 from ..models import ProviderListing, SearchRequest
 from ..provider_contracts import ListingProviderError
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    curl_requests = None
+
 
 PRICE_PATTERN = re.compile(r"(\d[\d,]*)")
 ZIP_CODE_PATTERN = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
@@ -18,6 +24,23 @@ SCRIPT_ASSIGNMENT_PATTERN = re.compile(
     re.DOTALL,
 )
 JSON_PARSE_PATTERN = re.compile(r"JSON\.parse\((\".*?\")\)", re.DOTALL)
+ASYNC_SEARCH_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en",
+    "Content-Type": "application/json",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "origin": "https://www.zillow.com",
+    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
 
 
 class ZillowChromiumProvider:
@@ -54,7 +77,9 @@ class ZillowChromiumProvider:
                 "complete the challenge in the opened browser window and retry."
             )
 
-        listings = self.extract_listings(html, request.zip_code)
+        listings = self._extract_api_listings(html, request)
+        if not listings:
+            listings = self.extract_listings(html, request.zip_code)
         return [listing for listing in listings if self._matches_request(listing, request)]
 
     def build_search_url(self, request: SearchRequest) -> str:
@@ -77,6 +102,137 @@ class ZillowChromiumProvider:
             return sorted(listing_by_id.values(), key=lambda listing: listing.external_id)
 
         return self._extract_fallback_anchor_listings(html, zip_code)
+
+    def _extract_api_listings(self, html: str, request: SearchRequest) -> list[ProviderListing]:
+        if curl_requests is None:
+            return []
+
+        search_context = self._extract_search_context(html, request)
+        if search_context is None:
+            return []
+
+        search_results = self._fetch_async_search_results(search_context, request)
+        candidates = search_results.get("mapResults") or search_results.get("listResults") or []
+        listings: dict[str, ProviderListing] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            listing = self._convert_candidate_to_listing(candidate, request.zip_code)
+            if listing is None:
+                continue
+            listings.setdefault(listing.external_id, listing)
+        return sorted(listings.values(), key=lambda listing: listing.external_id)
+
+    def _extract_search_context(self, html: str, request: SearchRequest) -> dict[str, Any] | None:
+        parser = _ScriptTagCollector()
+        parser.feed(html)
+
+        for script in parser.scripts:
+            for payload in _extract_json_payloads(script):
+                for mapping in _walk_mappings(payload):
+                    search_page_state = mapping.get("searchPageState")
+                    if isinstance(search_page_state, dict):
+                        context = self._build_search_context(search_page_state, request)
+                        if context is not None:
+                            return context
+
+                    query_state = mapping.get("searchQueryState")
+                    if isinstance(query_state, dict):
+                        context = self._build_search_context({"queryState": query_state}, request)
+                        if context is not None:
+                            return context
+        return None
+
+    def _build_search_context(self, search_page_state: dict[str, Any], request: SearchRequest) -> dict[str, Any] | None:
+        query_state = search_page_state.get("queryState")
+        if not isinstance(query_state, dict):
+            return None
+
+        map_bounds = query_state.get("mapBounds")
+        if not isinstance(map_bounds, dict):
+            return None
+
+        if not all(bound in map_bounds for bound in ("west", "east", "south", "north")):
+            return None
+
+        filter_state = query_state.get("filterState")
+        if not isinstance(filter_state, dict):
+            filter_state = {}
+
+        return {
+            "mapBounds": map_bounds,
+            "filterState": filter_state,
+            "regionSelection": query_state.get("regionSelection"),
+            "mapZoom": query_state.get("mapZoom", 13),
+            "usersSearchTerm": query_state.get("usersSearchTerm") or request.zip_code,
+        }
+
+    def _fetch_async_search_results(self, search_context: dict[str, Any], request: SearchRequest) -> dict[str, Any]:
+        filter_state = self._build_api_filter_state(search_context.get("filterState", {}), request)
+        payload: dict[str, Any] = {
+            "searchQueryState": {
+                "isMapVisible": True,
+                "isListVisible": True,
+                "mapBounds": search_context["mapBounds"],
+                "filterState": filter_state,
+                "mapZoom": search_context.get("mapZoom", 13),
+                "pagination": {"currentPage": 1},
+                "usersSearchTerm": search_context.get("usersSearchTerm") or request.zip_code,
+            },
+            "wants": {
+                "cat1": ["listResults", "mapResults"],
+                "cat2": ["total"],
+            },
+            "requestId": 10,
+            "isDebugRequest": False,
+        }
+
+        region_selection = search_context.get("regionSelection")
+        if region_selection:
+            payload["searchQueryState"]["regionSelection"] = region_selection
+
+        response = curl_requests.put(
+            url=f"{self.base_url}/async-create-search-page-state",
+            json=payload,
+            headers=ASYNC_SEARCH_HEADERS,
+            impersonate="chrome124",
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("cat1", {}).get("searchResults", {})
+
+    def _build_api_filter_state(self, base_filter_state: dict[str, Any], request: SearchRequest) -> dict[str, Any]:
+        filter_state = copy.deepcopy(base_filter_state)
+        filter_state.update(
+            {
+                "sortSelection": {"value": "priorityscore"},
+                "isNewConstruction": {"value": False},
+                "isForSaleForeclosure": {"value": False},
+                "isForSaleByOwner": {"value": False},
+                "isForSaleByAgent": {"value": False},
+                "isForRent": {"value": True},
+                "isComingSoon": {"value": False},
+                "isAuction": {"value": False},
+                "isAllHomes": {"value": True},
+                "isEntirePlaceForRent": {"value": True},
+            }
+        )
+
+        if request.min_rent is not None or request.max_rent is not None:
+            price_filter: dict[str, Any] = {}
+            if request.min_rent is not None:
+                price_filter["min"] = request.min_rent
+            if request.max_rent is not None:
+                price_filter["max"] = request.max_rent
+            filter_state["price"] = price_filter
+
+        if request.beds is not None:
+            filter_state["beds"] = {"min": request.beds}
+
+        if request.baths is not None:
+            filter_state["baths"] = {"min": request.baths}
+
+        return filter_state
 
     def _convert_candidate_to_listing(
         self,
@@ -309,6 +465,17 @@ def _walk_listing_candidates(payload: Any) -> Iterable[dict[str, Any]]:
         if isinstance(current, dict):
             if _looks_like_listing(current):
                 yield current
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+
+
+def _walk_mappings(payload: Any) -> Iterable[dict[str, Any]]:
+    stack = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            yield current
             stack.extend(current.values())
         elif isinstance(current, list):
             stack.extend(current)

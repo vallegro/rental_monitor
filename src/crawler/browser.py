@@ -144,7 +144,6 @@ class ChromiumBrowser:
         poll_interval = poll_interval_seconds or self.poll_interval_seconds
         deadline = time.monotonic() + timeout_value
         last_html = ""
-        target_url = url.rstrip("/")
 
         try:
             with _DevToolsConnection(tab.web_socket_url, timeout_seconds=self.command_timeout_seconds) as connection:
@@ -164,14 +163,17 @@ class ChromiumBrowser:
                     page_loaded = (
                         isinstance(current_url, str)
                         and current_url.rstrip("/") not in {"about:blank", ""}
-                        and current_url.rstrip("/") == target_url
                     )
                     html_loaded = last_html not in {"", "<html><head></head><body></body></html>"}
+                    browser_ready = ready_state in {"interactive", "complete"}
                     if (
-                        ready_state == "complete"
-                        and page_loaded
+                        page_loaded
                         and html_loaded
-                        and (wait_until is None or wait_until(last_html))
+                        and (
+                            wait_until(last_html)
+                            if wait_until is not None
+                            else browser_ready
+                        )
                     ):
                         return last_html
 

@@ -2,14 +2,15 @@
 
 ## Problem and approach
 
-Build a service that monitors rental listings for configured ZIP codes, detects meaningful changes, and emails a concise summary to the user. The recommended approach is a modular pipeline:
+Build a service that monitors rental listings for configured ZIP codes, detects meaningful changes, and emails a concise summary to the user. The recommended approach is a modular pipeline with a persisted daily snapshot handoff between crawling and processing:
 
 1. Load configuration and credentials.
 2. Query a listing data source on a schedule.
-3. Normalize listings into an internal schema.
-4. Compare the latest snapshot with stored state.
-5. Produce a summary of new, changed, and removed listings.
-6. Send the summary by email and record delivery results.
+3. Write the crawl result to a daily snapshot file.
+4. Normalize listings from the snapshot into an internal schema.
+5. Compare the latest snapshot-derived state with stored state.
+6. Produce a summary of new, changed, and removed listings.
+7. Send the summary by email and record delivery results.
 
 Important assumption: direct Zillow scraping may be unreliable or restricted by terms of service, so the ingestion layer should be designed as a provider adapter. Start with a compliant source if available, and keep Zillow-specific logic isolated behind an interface.
 
@@ -136,14 +137,57 @@ class HttpClient(Protocol):
                  headers: dict[str, str] | None = None) -> str: ...
 ```
 
-### 5. `normalizer`
+### 5. `snapshot_writer`
 
 Responsibility:
-- Convert provider-specific records into a canonical internal listing schema.
+- Persist crawler output as an immutable daily handoff artifact.
+- Create the formal boundary between the crawler module and the processing module.
+- Allow replaying, reprocessing, and debugging without crawling again.
+
+Inputs:
+- provider name
+- crawl metadata
+- `list[ProviderListing]`
+
+Outputs:
+- `DailyCrawlSnapshot`
+- snapshot file on disk or object storage
+
+Public interface:
+```python
+class DailyCrawlSnapshot(TypedDict):
+    snapshot_id: str
+    snapshot_date: str
+    created_at: str
+    provider: str
+    zip_code: str
+    query: dict[str, object]
+    listing_count: int
+    listings: list[ProviderListing]
+
+def write_snapshot(*, provider: str, zip_code: str,
+                   query: dict[str, object],
+                   listings: list[ProviderListing]) -> DailyCrawlSnapshot: ...
+```
+
+Recommended storage layout:
+```text
+snapshots/
+  provider=zillow/
+    date=2026-03-16/
+      zip=98102/
+        crawl-2026-03-16T02-00-00Z.json
+```
+
+### 6. `normalizer`
+
+Responsibility:
+- Convert provider-specific records from snapshot files into a canonical internal listing schema.
 - Standardize addresses, money values, URLs, timestamps, and IDs.
 
 Inputs:
 - `ProviderListing`
+- `DailyCrawlSnapshot`
 
 Outputs:
 - `CanonicalListing`
@@ -183,6 +227,30 @@ def normalize_listing(source: str, item: ProviderListing) -> CanonicalListing: .
 ## Human-readable internal schema
 
 The most important internal format is `CanonicalListing`. Every provider adapter must emit records that can be normalized into this shape, and every downstream module should work with this schema instead of provider-specific fields.
+
+The formal handoff between the crawler module and the processing module is not `CanonicalListing` directly. It is the persisted `DailyCrawlSnapshot`. The crawler owns producing `ProviderListing` items and saving them into a snapshot. The processor owns reading snapshots, normalizing them, filtering them, and computing diffs.
+
+### `DailyCrawlSnapshot` field guide
+
+| Field | Type | Meaning | Example |
+| --- | --- | --- | --- |
+| `snapshot_id` | `str` | Stable ID for one crawl artifact. | `zillow-98102-2026-03-16T02:00:00Z` |
+| `snapshot_date` | `str` | Logical business date for the crawl batch. | `2026-03-16` |
+| `created_at` | `str` | ISO timestamp when the snapshot file was written. | `2026-03-16T02:00:03Z` |
+| `provider` | `str` | Provider that produced the data. | `zillow` |
+| `zip_code` | `str` | ZIP code covered by this snapshot file. | `98102` |
+| `query` | `dict[str, object]` | Search parameters used for the crawl. | `{"min_rent": 2000, "beds": 2}` |
+| `listing_count` | `int` | Number of raw listings included. | `24` |
+| `listings` | `list[ProviderListing]` | Raw provider records for downstream processing. | `[{...}]` |
+
+### Snapshot handoff rules
+
+- The crawler module is only responsible for fetching and writing snapshots.
+- The processing module only reads snapshots and never depends on live crawl responses.
+- Snapshot files should be immutable after creation.
+- A failed processing run should be restartable from the last successful snapshot without recrawling.
+- Snapshot metadata should be rich enough to trace which query produced the data.
+- JSON is the safer production default, even if YAML examples are easier for humans to read.
 
 ### `CanonicalListing` field guide
 
@@ -264,10 +332,11 @@ class EmailSummary(TypedDict):
 A concrete, human-readable example of the internal schema should live in:
 
 - `examples/internal-schema.example.yaml`
+- `examples/daily-crawl-snapshot.example.yaml`
 
-That file is the quickest reference for how records should look in practice.
+These files are the quickest references for how records should look in practice.
 
-### 6. `filters`
+### 7. `filters`
 
 Responsibility:
 - Apply user-defined selection rules after normalization.
@@ -285,7 +354,7 @@ Public interface:
 def matches_filters(listing: CanonicalListing, filters: dict[str, object]) -> bool: ...
 ```
 
-### 7. `storage`
+### 8. `storage`
 
 Responsibility:
 - Persist current listings, snapshot history, and notification history.
@@ -316,7 +385,7 @@ class ListingRepository(Protocol):
     def record_notification(self, payload: dict[str, object]) -> None: ...
 ```
 
-### 8. `diff_engine`
+### 9. `diff_engine`
 
 Responsibility:
 - Compare current normalized listings with previously stored state.
@@ -341,7 +410,7 @@ def diff_listings(previous: list[CanonicalListing],
                   current: list[CanonicalListing]) -> DiffResult: ...
 ```
 
-### 9. `summary`
+### 10. `summary`
 
 Responsibility:
 - Turn diffs into a human-readable digest.
@@ -365,7 +434,7 @@ class EmailSummary(TypedDict):
 def build_summary(diff: DiffResult, *, zip_code: str) -> EmailSummary: ...
 ```
 
-### 10. `emailer`
+### 11. `emailer`
 
 Responsibility:
 - Send email using SMTP or an email API.
@@ -385,7 +454,7 @@ class EmailSender(Protocol):
              html_body: str | None = None) -> str: ...
 ```
 
-### 11. `scheduler`
+### 12. `scheduler`
 
 Responsibility:
 - Run the monitor at the configured interval.
@@ -403,7 +472,7 @@ def run_once(config: AppConfig) -> None: ...
 def run_forever(config: AppConfig) -> None: ...
 ```
 
-### 12. `orchestrator`
+### 13. `orchestrator`
 
 Responsibility:
 - Coordinate one full monitoring cycle.
@@ -424,7 +493,7 @@ Public interface:
 def execute_monitoring_run(config: AppConfig) -> dict[str, object]: ...
 ```
 
-### 13. `logging_and_metrics`
+### 14. `logging_and_metrics`
 
 Responsibility:
 - Structured logs for fetches, diffs, and email sends.
@@ -453,6 +522,7 @@ config
 
 orchestrator
   -> provider_contracts / providers.<source>
+  -> snapshot_writer
   -> normalizer
   -> filters
   -> storage
@@ -470,25 +540,28 @@ orchestrator
 2. `orchestrator -> provider`
 - calls `search(SearchRequest)` once per ZIP code or per query variant
 
-3. `provider -> normalizer`
+3. `provider -> snapshot_writer`
 - returns `ProviderListing` records that still contain source-specific raw payloads
 
-4. `normalizer -> filters`
+4. `snapshot_writer -> normalizer`
+- persists and exposes `DailyCrawlSnapshot` as the handoff artifact for downstream processing
+
+5. `normalizer -> filters`
 - passes `CanonicalListing`
 
-5. `filters -> storage`
+6. `filters -> storage`
 - only accepted canonical listings are persisted as current observations
 
-6. `storage -> diff_engine`
+7. `storage -> diff_engine`
 - repository returns previous state for the same source and ZIP code
 
-7. `diff_engine -> summary`
+8. `diff_engine -> summary`
 - emits `DiffResult`, which should contain `ListingChange` records instead of anonymous dicts
 
-8. `summary -> emailer`
+9. `summary -> emailer`
 - emits `EmailSummary`
 
-9. `emailer -> storage`
+10. `emailer -> storage`
 - returns provider message ID or delivery metadata to persist in `notifications`
 
 ## Suggested database model
@@ -506,6 +579,17 @@ orchestrator
 - `changed_count`
 - `removed_count`
 - `error_message`
+
+### `crawl_snapshots`
+- `snapshot_id` primary key
+- `snapshot_date`
+- `created_at`
+- `provider`
+- `zip_code`
+- `query_json`
+- `listing_count`
+- `file_path`
+- `content_hash`
 
 ### `listings`
 - `listing_id` primary key
@@ -537,6 +621,7 @@ orchestrator
 - `id`
 - `listing_id`
 - `run_id`
+- `snapshot_id`
 - `observed_at`
 - `rent_amount`
 - `rent_currency`
@@ -569,6 +654,7 @@ orchestrator
 ### Phase 1: vertical slice
 - config loading
 - one provider adapter
+- snapshot file writing
 - normalization
 - SQLite storage
 - diff detection

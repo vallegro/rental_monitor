@@ -333,8 +333,9 @@ A concrete, human-readable example of the internal schema should live in:
 
 - `examples/internal-schema.example.yaml`
 - `examples/daily-crawl-snapshot.example.yaml`
+- `examples/daily-crawl-snapshots/`
 
-These files are the quickest references for how records should look in practice.
+These files are the quickest references for how records should look in practice. The dated files under `examples/daily-crawl-snapshots/` show how the handoff artifact changes across several days.
 
 ### 7. `filters`
 

@@ -1,0 +1,54 @@
+snapshot_id: "zillow-98102-2026-03-15T02:00:00Z"
+snapshot_date: "2026-03-15"
+created_at: "2026-03-15T02:00:04Z"
+provider: "zillow"
+zip_code: "98102"
+query:
+  min_rent: 2000
+  max_rent: 3000
+  beds: 2
+  baths: 1.0
+  property_types:
+    - "apartment"
+    - "condo"
+listing_count: 3
+listings:
+  - external_id: "2067812345"
+    url: "https://www.zillow.com/homedetails/123-Main-St-APT-4B-Seattle-WA-98102/2067812345_zpid/"
+    address: "123 Main St Apt 4B, Seattle, WA 98102"
+    zip_code: "98102"
+    rent: 2550
+    beds: 2.0
+    baths: 1.5
+    sqft: 920
+    listed_at: "2026-03-13T18:44:00Z"
+    provider_payload:
+      provider: "zillow"
+      external_status: "for_rent"
+      neighborhood: "Capitol Hill"
+  - external_id: "2088899911"
+    url: "https://www.zillow.com/homedetails/45-Pine-St-12-Seattle-WA-98102/2088899911_zpid/"
+    address: "45 Pine St #12, Seattle, WA 98102"
+    zip_code: "98102"
+    rent: 2550
+    beds: 2.0
+    baths: 1.0
+    sqft: 875
+    listed_at: "2026-03-13T21:10:00Z"
+    provider_payload:
+      provider: "zillow"
+      external_status: "for_rent"
+      neighborhood: "Capitol Hill"
+  - external_id: "2090001122"
+    url: "https://www.zillow.com/homedetails/78-Olive-Way-7-Seattle-WA-98102/2090001122_zpid/"
+    address: "78 Olive Way #7, Seattle, WA 98102"
+    zip_code: "98102"
+    rent: 2895
+    beds: 2.0
+    baths: 2.0
+    sqft: 1010
+    listed_at: "2026-03-14T23:20:00Z"
+    provider_payload:
+      provider: "zillow"
+      external_status: "for_rent"
+      neighborhood: "Capitol Hill"

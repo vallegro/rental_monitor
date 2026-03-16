@@ -139,26 +139,40 @@ class ChromiumBrowser:
         poll_interval_seconds: float | None = None,
     ) -> str:
         self.launch()
-        tab = self.open_tab(url)
+        tab = self.open_tab()
         timeout_value = timeout_seconds or self.interactive_timeout_seconds
         poll_interval = poll_interval_seconds or self.poll_interval_seconds
         deadline = time.monotonic() + timeout_value
         last_html = ""
+        target_url = url.rstrip("/")
 
         try:
             with _DevToolsConnection(tab.web_socket_url, timeout_seconds=self.command_timeout_seconds) as connection:
                 connection.send_command("Runtime.enable")
                 connection.send_command("Page.enable")
+                connection.send_command("Page.navigate", {"url": url})
 
                 while time.monotonic() < deadline:
                     ready_state = connection.evaluate("document.readyState")
+                    current_url = connection.evaluate("window.location.href")
                     html = connection.evaluate("document.documentElement.outerHTML")
                     if isinstance(html, str):
                         last_html = html
                     elif html is not None:
                         last_html = str(html)
 
-                    if ready_state == "complete" and last_html and (wait_until is None or wait_until(last_html)):
+                    page_loaded = (
+                        isinstance(current_url, str)
+                        and current_url.rstrip("/") not in {"about:blank", ""}
+                        and current_url.rstrip("/") == target_url
+                    )
+                    html_loaded = last_html not in {"", "<html><head></head><body></body></html>"}
+                    if (
+                        ready_state == "complete"
+                        and page_loaded
+                        and html_loaded
+                        and (wait_until is None or wait_until(last_html))
+                    ):
                         return last_html
 
                     time.sleep(poll_interval)
@@ -172,7 +186,7 @@ class ChromiumBrowser:
             )
         raise ChromiumBrowserError("Chromium did not return any page content")
 
-    def open_tab(self, url: str) -> ChromiumTab:
+    def open_tab(self, url: str = "about:blank") -> ChromiumTab:
         response = self._request_json(f"/json/new?{quote(url, safe='')}", method="PUT")
         if not isinstance(response, dict):
             raise ChromiumBrowserError("Chromium returned an invalid target response")

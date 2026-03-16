@@ -83,12 +83,13 @@ class ZillowChromiumProvider:
         candidate: dict[str, Any],
         request_zip_code: str,
     ) -> ProviderListing | None:
-        external_id = _coalesce(
+        raw_external_id = _coalesce(
             candidate.get("zpid"),
             candidate.get("id"),
             _nested_get(candidate, "hdpData", "homeInfo", "zpid"),
         )
         url = _coalesce(candidate.get("detailUrl"), candidate.get("hdpUrl"), candidate.get("url"))
+        external_id = self._normalize_external_id(raw_external_id, url)
         address = self._extract_address(candidate)
         zip_code = _coalesce(
             candidate.get("zipcode"),
@@ -114,7 +115,7 @@ class ZillowChromiumProvider:
 
         normalized_url = url if url.startswith("http") else urljoin(f"{self.base_url}/", url.lstrip("/"))
         return ProviderListing(
-            external_id=str(external_id),
+            external_id=external_id,
             url=normalized_url,
             address=address,
             zip_code=str(zip_code),
@@ -125,6 +126,19 @@ class ZillowChromiumProvider:
             listed_at=listed_at,
             provider_payload=provider_payload,
         )
+
+    def _normalize_external_id(self, raw_external_id: Any, url: Any) -> str | None:
+        if isinstance(raw_external_id, (int, float)):
+            return str(int(raw_external_id))
+        if isinstance(raw_external_id, str):
+            stripped = raw_external_id.strip()
+            if stripped.isdigit():
+                return stripped
+        if isinstance(url, str):
+            match = re.search(r"/(\d+)_zpid/?", url)
+            if match:
+                return match.group(1)
+        return None
 
     def _extract_address(self, candidate: dict[str, Any]) -> str | None:
         direct_address = candidate.get("address")

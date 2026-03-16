@@ -154,14 +154,24 @@ class CanonicalListing(TypedDict):
     listing_id: str
     source: str
     source_listing_id: str
-    url: str
-    address: str
+    source_url: str
+    title: str | None
+    address_line: str
+    city: str | None
+    state: str | None
     zip_code: str
-    rent: int | None
+    neighborhood: str | None
+    latitude: float | None
+    longitude: float | None
+    rent_amount: int | None
+    rent_currency: str
+    rent_period: str
     beds: float | None
     baths: float | None
     sqft: int | None
-    status: str
+    property_type: str | None
+    available_date: str | None
+    listing_status: str
     first_seen_at: str | None
     seen_at: str
     fingerprint: str
@@ -169,6 +179,93 @@ class CanonicalListing(TypedDict):
 
 def normalize_listing(source: str, item: ProviderListing) -> CanonicalListing: ...
 ```
+
+## Human-readable internal schema
+
+The most important internal format is `CanonicalListing`. Every provider adapter must emit records that can be normalized into this shape, and every downstream module should work with this schema instead of provider-specific fields.
+
+### `CanonicalListing` field guide
+
+| Field | Type | Meaning | Example |
+| --- | --- | --- | --- |
+| `listing_id` | `str` | Stable internal identifier. Recommended format: `<source>:<source_listing_id>`. | `zillow:2067812345` |
+| `source` | `str` | Name of the provider adapter that produced the record. | `zillow` |
+| `source_listing_id` | `str` | Provider-native identifier. | `2067812345` |
+| `source_url` | `str` | Canonical URL to open the listing. | `https://www.zillow.com/...` |
+| `title` | `str \| None` | Optional short label for display and emails. | `2 bed apartment in Capitol Hill` |
+| `address_line` | `str` | Street address or best available address line. | `123 Main St Apt 4B` |
+| `city` | `str \| None` | City name if available. | `Seattle` |
+| `state` | `str \| None` | Two-letter state code if available. | `WA` |
+| `zip_code` | `str` | ZIP code used for routing, filtering, and summaries. | `98102` |
+| `neighborhood` | `str \| None` | Optional neighborhood label from the source. | `Capitol Hill` |
+| `latitude` | `float \| None` | Optional latitude for map links or dedupe help. | `47.62531` |
+| `longitude` | `float \| None` | Optional longitude for map links or dedupe help. | `-122.32111` |
+| `rent_amount` | `int \| None` | Numeric rent value with currency and billing period split out. | `2495` |
+| `rent_currency` | `str` | Currency code. Default should be `USD` unless a provider says otherwise. | `USD` |
+| `rent_period` | `str` | Billing period. Keep this explicit instead of assuming monthly forever. | `month` |
+| `beds` | `float \| None` | Number of bedrooms. | `2.0` |
+| `baths` | `float \| None` | Number of bathrooms. | `1.5` |
+| `sqft` | `int \| None` | Square footage. | `920` |
+| `property_type` | `str \| None` | Human-readable property type. | `apartment` |
+| `available_date` | `str \| None` | ISO date when the unit becomes available. | `2026-04-01` |
+| `listing_status` | `str` | Normalized state in our system. Recommended values: `active`, `removed`, `unknown`. | `active` |
+| `first_seen_at` | `str \| None` | ISO timestamp for the first time we observed the listing. | `2026-03-16T01:00:00Z` |
+| `seen_at` | `str` | ISO timestamp for the current observation. | `2026-03-16T02:00:00Z` |
+| `fingerprint` | `str` | Hash of the listing fields used for change detection. | `f6ab0d...` |
+| `raw` | `dict[str, object]` | Raw provider payload for debugging and future parsing improvements. | `{...}` |
+
+### Schema design rules
+
+- IDs must be stable across runs.
+- Timestamps must be ISO 8601 UTC strings.
+- Money must be split into amount, currency, and billing period.
+- Address fields should be structured when possible, not packed into one display string.
+- Missing values should be `None`, not placeholder text like `"unknown"`.
+- The `raw` payload is retained for traceability, but downstream business logic should use normalized fields.
+
+### Related internal records
+
+The canonical listing record is the primary payload, but two other internal record types matter for module boundaries:
+
+#### `ListingChange`
+
+Used by `diff_engine` and `summary` to describe what changed.
+
+```python
+class ListingChange(TypedDict):
+    listing_id: str
+    change_type: str
+    previous: CanonicalListing | None
+    current: CanonicalListing | None
+    changed_fields: list[str]
+```
+
+Recommended `change_type` values:
+- `new`
+- `price_changed`
+- `details_changed`
+- `removed`
+- `returned`
+
+#### `EmailSummary`
+
+Used by `summary` and `emailer`.
+
+```python
+class EmailSummary(TypedDict):
+    subject: str
+    text_body: str
+    html_body: str | None
+    listing_ids: list[str]
+```
+
+### Example format in the repo
+
+A concrete, human-readable example of the internal schema should live in:
+
+- `examples/internal-schema.example.yaml`
+
+That file is the quickest reference for how records should look in practice.
 
 ### 6. `filters`
 
@@ -386,7 +483,7 @@ orchestrator
 - repository returns previous state for the same source and ZIP code
 
 7. `diff_engine -> summary`
-- emits `DiffResult`
+- emits `DiffResult`, which should contain `ListingChange` records instead of anonymous dicts
 
 8. `summary -> emailer`
 - emits `EmailSummary`
@@ -414,14 +511,24 @@ orchestrator
 - `listing_id` primary key
 - `source`
 - `source_listing_id`
+- `source_url`
+- `title`
+- `address_line`
+- `city`
+- `state`
 - `zip_code`
-- `address`
-- `url`
-- `rent`
+- `neighborhood`
+- `latitude`
+- `longitude`
+- `rent_amount`
+- `rent_currency`
+- `rent_period`
 - `beds`
 - `baths`
 - `sqft`
-- `status`
+- `property_type`
+- `available_date`
+- `listing_status`
 - `first_seen_at`
 - `last_seen_at`
 - `fingerprint`
@@ -431,10 +538,13 @@ orchestrator
 - `listing_id`
 - `run_id`
 - `observed_at`
-- `rent`
+- `rent_amount`
+- `rent_currency`
+- `rent_period`
 - `beds`
 - `baths`
 - `sqft`
+- `listing_status`
 - `raw_json`
 
 ### `notifications`
